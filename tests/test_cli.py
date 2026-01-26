@@ -45,7 +45,7 @@ class DummyAutoModel:
     def to(self, device):
         return self
 
-    def generate(self, **kwargs):
+    def generate(self, *args, **kwargs):
         return torch.zeros((1, 3), dtype=torch.long)
 
 

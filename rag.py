@@ -4,6 +4,8 @@ import json
 import csv
 from io import StringIO
 from typing import TypedDict
+from pathlib import Path
+import hashlib
 import faiss
 import numpy as np
 import torch
@@ -91,6 +93,119 @@ def load_html(path):
         html = f.read()
     return html2text.html2text(html)
 
+
+_SUPPORTED_EXTS = {".txt", ".md", ".pdf", ".docx", ".html", ".htm", ".csv", ".json"}
+
+
+def _cache_dir(folder: str) -> str:
+    return os.path.join(folder, ".rag_cache")
+
+
+def _cache_paths(folder: str) -> tuple[str, str, str]:
+    cache = _cache_dir(folder)
+    return (
+        os.path.join(cache, "meta.json"),
+        os.path.join(cache, "chunks.jsonl"),
+        os.path.join(cache, "faiss.index"),
+    )
+
+
+def _corpus_fingerprint(folder: str) -> list[dict]:
+    base = Path(folder)
+    cache = Path(_cache_dir(folder))
+    files: list[dict] = []
+    for p in base.rglob("*"):
+        if not p.is_file():
+            continue
+        if cache in p.parents:
+            continue
+        if p.suffix.lower() not in _SUPPORTED_EXTS:
+            continue
+        st = p.stat()
+        files.append(
+            {
+                "path": str(p.relative_to(base)),
+                "mtime_ns": int(st.st_mtime_ns),
+                "size": int(st.st_size),
+            }
+        )
+    files.sort(key=lambda x: x["path"])
+    return files
+
+
+def _load_chunks_jsonl(path: str) -> list[tuple[str, str]]:
+    chunks: list[tuple[str, str]] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            chunks.append((rec["path"], rec["text"]))
+    return chunks
+
+
+def _save_chunks_jsonl(path: str, chunks: list[tuple[str, str]]):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for p, c in chunks:
+            f.write(json.dumps({"path": p, "text": c}, ensure_ascii=False))
+            f.write("\n")
+
+
+def _ensure_faiss_cache(
+    *,
+    folder: str,
+    embedder,
+    embedder_name: str,
+    reindex: bool,
+    chunk_size: int,
+    overlap: int,
+):
+    meta_path, chunks_path, index_path = _cache_paths(folder)
+
+    if not reindex and os.path.exists(meta_path) and os.path.exists(chunks_path) and os.path.exists(index_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            if (
+                meta.get("embedder") == embedder_name
+                and meta.get("chunk_size") == chunk_size
+                and meta.get("overlap") == overlap
+                and meta.get("files") == _corpus_fingerprint(folder)
+            ):
+                chunks = _load_chunks_jsonl(chunks_path)
+                index = load_faiss(index_path)
+                return chunks, index
+        except Exception:
+            pass
+
+    log("Budowa cache RAG (chunks + FAISS)...")
+    docs = load_all_docs(folder)
+    if not docs:
+        return [], None
+
+    chunks: list[tuple[str, str]] = []
+    for path, text in docs:
+        for chunk in chunk_text(text, chunk_size=chunk_size, overlap=overlap):
+            chunks.append((path, chunk))
+
+    index, _ = build_faiss_index(chunks, embedder)
+    os.makedirs(os.path.dirname(index_path), exist_ok=True)
+    save_faiss(index, index_path)
+    _save_chunks_jsonl(chunks_path, chunks)
+
+    meta = {
+        "embedder": embedder_name,
+        "chunk_size": chunk_size,
+        "overlap": overlap,
+        "files": _corpus_fingerprint(folder),
+    }
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    return chunks, index
+
 def load_csv(path):
     def _read(handle):
         reader = csv.reader(handle)
@@ -118,7 +233,10 @@ def load_json(path):
 
 def load_all_docs(folder):
     docs = []
+    cache_dir = os.path.abspath(_cache_dir(folder))
     for root, _, files in os.walk(folder):
+        if os.path.abspath(root).startswith(cache_dir + os.sep):
+            continue
         for fname in files:
             path = os.path.join(root, fname)
             ext = os.path.splitext(fname)[1].lower()
@@ -226,7 +344,7 @@ def generate_answer(question, docs, model, tokenizer, device):
     for idx, (p, c) in enumerate(docs, start=1):
         sources.append(f"[{idx}] {os.path.basename(p)}\n{c}")
     context = "\n\n".join(sources)
-
+    
     prompt = (
         "Jesteś pomocnym asystentem.\n"
         "Odpowiedz WYŁĄCZNIE na pytanie, bez powtarzania kontekstu ani poleceń.\n"
@@ -237,10 +355,12 @@ def generate_answer(question, docs, model, tokenizer, device):
         f"Pytanie: {question}\n"
         "Odpowiedź (po polsku, markdown, z cytowaniami [1], [2]):\n"
     )
-
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    
+    # Aggressively truncate prompt if it's too long for the model's max length
+    max_length = min(getattr(model.config, 'max_position_embeddings', 1024), 512)  # Limit to 512 if possible
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_length).to(device)
     input_len = inputs["input_ids"].shape[-1]
-
+    
     try:
         outputs = model.generate(
             inputs["input_ids"],
@@ -249,6 +369,15 @@ def generate_answer(question, docs, model, tokenizer, device):
             do_sample=False,
             pad_token_id=tokenizer.eos_token_id,
         )
+    except RuntimeError as e:
+        if "active drivers" in str(e):
+            log("Error with Triton runtime: incompatible environment or driver issue. Consider setting up CUDA properly or using a different model.")
+            log("As a workaround, try setting a different model with environment variable BOLMO_MODEL, e.g., 'export BOLMO_MODEL=gpt2'.")
+            return "Error: Unable to generate answer due to environment setup issues. See logs for details."
+        raise
+    except IndexError as e:
+        log("Error: Input too long or incompatible with model constraints. Try a smaller context or a different model.")
+        return "Error: Unable to generate answer due to model constraints. See logs for details."
     except TypeError as e:
         log(f"TypeError in generate call: {e}")
         log("Trying alternative generate call signature...")
@@ -290,43 +419,140 @@ def generate_answer(question, docs, model, tokenizer, device):
 
 def main():
     parser = argparse.ArgumentParser(description="Bolmo RAG - folder -> query -> markdown output")
+    parser.add_argument(
+        "--backend",
+        default=os.getenv("BOLMO_BACKEND", "faiss"),
+        choices=["faiss", "faiss_nocache", "qdrant"],
+        help="Backend retrievalu (faiss lub qdrant)",
+    )
     parser.add_argument("--folder", required=True, help="Ścieżka do folderu z dokumentami")
-    parser.add_argument("--query", required=True, help="Zapytanie")
+    parser.add_argument("--query", help="Zapytanie")
     parser.add_argument("--k", type=int, default=5, help="Ile fragmentów pobrać (retrieval)")
+    parser.add_argument("--reindex", action="store_true", help="Wymuś przebudowę cache/indexu")
+    parser.add_argument("--index-only", action="store_true", help="Tylko zbuduj cache/index i zakończ")
     args = parser.parse_args()
 
-    log(f"Ładowanie dokumentów z {args.folder}...")
-    docs = load_all_docs(args.folder)
-    if not docs:
-        log("Brak dokumentów w podanym folderze.")
-        return
-    log(f"Załadowano {len(docs)} plików.")
+    if not args.index_only and not args.query:
+        parser.error("--query jest wymagane (chyba że używasz --index-only)")
 
-    log("Chunkowanie dokumentów...")
-    chunks = []
-    for path, text in docs:
-        for chunk in chunk_text(text):
-            chunks.append((path, chunk))
-    log(f"Chunkowanie zakończone – {len(chunks)} fragmentów.")
+    chunk_size = int(os.getenv("BOLMO_CHUNK_SIZE", "800"))
+    overlap = int(os.getenv("BOLMO_CHUNK_OVERLAP", "200"))
 
     embedder_name = os.getenv("BOLMO_EMBEDDER", "all-MiniLM-L6-v2")
     log(f"Ładowanie embeddera {embedder_name}...")
     embedder = SentenceTransformer(embedder_name)
 
-    index_path = os.path.join(args.folder, "faiss.index")
+    retrieved = []
+    if args.backend == "faiss":
+        chunks, index = _ensure_faiss_cache(
+            folder=args.folder,
+            embedder=embedder,
+            embedder_name=embedder_name,
+            reindex=args.reindex,
+            chunk_size=chunk_size,
+            overlap=overlap,
+        )
+        if not chunks or index is None:
+            log("Brak dokumentów w podanym folderze.")
+            return
+        if args.index_only:
+            log("Cache/index gotowy.")
+            return
+        log(f"Retrieval – wyszukiwanie {args.k} fragmentów...")
+        retrieved = retrieve(args.query, chunks, index, embedder, k=args.k)
+        log(f"Pobrano {len(retrieved)} fragmentów kontekstu.")
+    elif args.backend == "faiss_nocache":
+        log(f"Ładowanie dokumentów z {args.folder}...")
+        docs = load_all_docs(args.folder)
+        if not docs:
+            log("Brak dokumentów w podanym folderze.")
+            return
+        log(f"Załadowano {len(docs)} plików.")
 
-    if os.path.exists(index_path):
-        log("Ładowanie istniejącego indexu FAISS...")
-        index = load_faiss(index_path)
-    else:
-        log("Budowa indexu FAISS...")
+        log("Chunkowanie dokumentów...")
+        chunks = []
+        for path, text in docs:
+            for chunk in chunk_text(text, chunk_size=chunk_size, overlap=overlap):
+                chunks.append((path, chunk))
+        log(f"Chunkowanie zakończone – {len(chunks)} fragmentów.")
+
+        log("Budowa indexu FAISS (bez cache)...")
         index, _ = build_faiss_index(chunks, embedder)
-        save_faiss(index, index_path)
-        log("Index zapisany na dysku.")
+        if args.index_only:
+            log("Index gotowy.")
+            return
 
-    log(f"Retrieval – wyszukiwanie {args.k} fragmentów...")
-    retrieved = retrieve(args.query, chunks, index, embedder, k=args.k)
-    log(f"Pobrano {len(retrieved)} fragmentów kontekstu.")
+        log(f"Retrieval – wyszukiwanie {args.k} fragmentów...")
+        retrieved = retrieve(args.query, chunks, index, embedder, k=args.k)
+        log(f"Pobrano {len(retrieved)} fragmentów kontekstu.")
+    else:
+        try:
+            from qdrant_client import QdrantClient
+            from qdrant_client.http import models as qdrant_models
+        except Exception as e:
+            raise RuntimeError(
+                "Backend qdrant wymaga pakietu qdrant-client. Zainstaluj go: pip install qdrant-client"
+            ) from e
+
+        qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
+        collection = os.getenv("QDRANT_COLLECTION", "bolmo_docs")
+        client = QdrantClient(url=qdrant_url)
+
+        collection_exists = client.collection_exists(collection_name=collection)
+        if args.reindex or args.index_only or not collection_exists:
+            docs = load_all_docs(args.folder)
+            if not docs:
+                log("Brak dokumentów w podanym folderze.")
+                return
+
+            chunks: list[tuple[str, str]] = []
+            for path, text in docs:
+                for chunk in chunk_text(text, chunk_size=chunk_size, overlap=overlap):
+                    chunks.append((path, chunk))
+
+            embeddings = embedder.encode([c for _, c in chunks], convert_to_numpy=True)
+            dim = int(embeddings.shape[1])
+
+            if collection_exists and args.reindex:
+                client.delete_collection(collection_name=collection)
+                collection_exists = False
+
+            if not collection_exists:
+                client.create_collection(
+                    collection_name=collection,
+                    vectors_config=qdrant_models.VectorParams(size=dim, distance=qdrant_models.Distance.COSINE),
+                )
+
+            points = []
+            for idx, ((p, c), vec) in enumerate(zip(chunks, embeddings)):
+                pid = idx + 1  # Use incremental integer instead of hash
+                points.append(
+                    qdrant_models.PointStruct(
+                        id=pid,
+                        vector=vec.tolist(),
+                        payload={"path": p, "text": c},
+                    )
+                )
+
+            batch = 128
+            for i in range(0, len(points), batch):
+                client.upsert(collection_name=collection, points=points[i : i + batch])
+
+            log("Ingest do Qdrant zakończony.")
+            if args.index_only:
+                return
+
+        q = embedder.encode([args.query], convert_to_numpy=True)[0].tolist()
+        hits = client.points_api.search_points(
+            collection_name=collection,
+            vector=q,
+            limit=args.k,
+            with_payload=True
+        ).points
+        for h in hits:
+            payload = h.payload or {}
+            retrieved.append((payload.get("path", ""), payload.get("text", "")))
+        log(f"Pobrano {len(retrieved)} fragmentów kontekstu.")
 
     force_cpu = os.getenv("BOLMO_FORCE_CPU", "").strip().lower() in {"1", "true", "yes"}
     if force_cpu and hasattr(torch, "cuda"):

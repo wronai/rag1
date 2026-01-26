@@ -1,19 +1,42 @@
-.PHONY: install run clean test docker-build docker-run
+.PHONY: install run index query reindex clean test docker-build docker-run
 
 VENV := .venv
-PYTHON := $(VENV)/bin/python
+PYTHON := $(shell if [ -x "$(VENV)/bin/python" ]; then echo "$(VENV)/bin/python"; elif [ -x "$(VENV)/Scripts/python.exe" ]; then echo "$(VENV)/Scripts/python.exe"; elif [ -x "$(VENV)/Scripts/python" ]; then echo "$(VENV)/Scripts/python"; else echo "$(VENV)/bin/python"; fi)
 FOLDER ?= ./docs
 QUERY ?= Co to jest Bolmo?
 K ?= 5
+BACKEND ?= faiss
+CUDA_HOME ?= /usr/local/cuda
 
-install: $(VENV)/bin/activate
+install: $(VENV)/.installed
 
-$(VENV)/bin/activate: install.sh
+$(VENV)/.installed: install.sh requirements.txt
 	./install.sh
-	touch $(VENV)/bin/activate
+	touch $(VENV)/.installed
 
 run: install
-	CUDA_HOME=/usr/local/cuda $(PYTHON) rag.py --folder $(FOLDER) --query "$(QUERY)" --k $(K)
+	@if [ -n "$(CUDA_HOME)" ] && [ -d "$(CUDA_HOME)" ]; then \
+		CUDA_HOME="$(CUDA_HOME)" $(PYTHON) rag.py --backend $(BACKEND) --folder $(FOLDER) --query "$(QUERY)" --k $(K); \
+	else \
+		$(PYTHON) rag.py --backend $(BACKEND) --folder $(FOLDER) --query "$(QUERY)" --k $(K); \
+	fi
+
+index: install
+	$(PYTHON) rag.py --backend $(BACKEND) --folder $(FOLDER) --index-only
+
+query: install
+	@if [ -n "$(CUDA_HOME)" ] && [ -d "$(CUDA_HOME)" ]; then \
+		CUDA_HOME="$(CUDA_HOME)" $(PYTHON) rag.py --backend $(BACKEND) --folder $(FOLDER) --query "$(QUERY)" --k $(K); \
+	else \
+		$(PYTHON) rag.py --backend $(BACKEND) --folder $(FOLDER) --query "$(QUERY)" --k $(K); \
+	fi
+
+reindex: install
+	@if [ "$(BACKEND)" = "qdrant" ]; then \
+		echo "Starting Qdrant server if not already running..."; \
+		docker run -d -p 6333:6333 --name qdrant-server qdrant/qdrant:latest || echo "Qdrant server already running or failed to start"; \
+	fi
+	BOLMO_FORCE_CPU=1 $(PYTHON) rag.py --backend $(BACKEND) --folder $(FOLDER) --reindex --index-only
 
 test: install
 	$(PYTHON) -m pytest -q

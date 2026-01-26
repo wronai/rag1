@@ -156,6 +156,8 @@ reports/
 *.json.bak
 env-report.json
 
+**/.rag_cache/
+
 # Secrets
 .env.local
 .env.*.local
