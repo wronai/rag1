@@ -222,21 +222,21 @@ def retrieve(query, chunks, index, embedder, k=5):
 # -----------------------------
 
 def generate_answer(question, docs, model, tokenizer, device):
-    context = "\n".join([f"### {os.path.basename(p)}\n{c}" for p, c in docs])
+    sources = []
+    for idx, (p, c) in enumerate(docs, start=1):
+        sources.append(f"[{idx}] {os.path.basename(p)}\n{c}")
+    context = "\n\n".join(sources)
 
-    prompt = f"""
-You are a helpful assistant.
-
-Use ONLY the context below to answer.
-If the answer is not in the context, respond: "Nie mam informacji w dokumentach."
-
-Context:
-{context}
-
-Question: {question}
-
-Answer in Polish in markdown format with references like [1], [2].
-"""
+    prompt = (
+        "Jesteś pomocnym asystentem.\n"
+        "Odpowiedz WYŁĄCZNIE na pytanie, bez powtarzania kontekstu ani poleceń.\n"
+        "Używaj TYLKO informacji z kontekstu.\n"
+        "Jeśli odpowiedzi nie ma w kontekście, napisz dokładnie: Nie mam informacji w dokumentach.\n\n"
+        "Kontekst (źródła oznaczone [1], [2], ...):\n"
+        f"{context}\n\n"
+        f"Pytanie: {question}\n"
+        "Odpowiedź (po polsku, markdown, z cytowaniami [1], [2]):\n"
+    )
 
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     input_len = inputs["input_ids"].shape[-1]
@@ -269,7 +269,20 @@ Answer in Polish in markdown format with references like [1], [2].
     generated_only = generated[input_len:]
     if generated_only.numel() == 0:
         return ""
-    return tokenizer.decode(generated_only, skip_special_tokens=True)
+
+    text = tokenizer.decode(generated_only, skip_special_tokens=True).strip()
+
+    for marker in ("Odpowiedź", "Answer"):
+        marker_colon = marker + ":"
+        if marker_colon in text:
+            text = text.split(marker_colon, 1)[1].strip()
+            break
+    for marker in ("Kontekst", "Context", "Pytanie", "Question"):
+        marker_colon = marker + ":"
+        if marker_colon in text:
+            text = text.split(marker_colon, 1)[0].strip()
+
+    return text
 
 # -----------------------------
 # 8) Main
