@@ -12,7 +12,7 @@ pip install --upgrade pip
 
 echo "=== Instalacja zależności ==="
 pip install \
-  transformers==4.34.0 \
+  transformers==4.39.0 \
   sentence-transformers \
   faiss-cpu \
   torch \

@@ -1,0 +1,9 @@
+{
+  "collection": "bolmo-demo",
+  "chunk_size": 512,
+  "overlap": 64,
+  "languages": [
+    "pl",
+    "en"
+  ]
+}
