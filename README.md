@@ -26,7 +26,7 @@ Skrypt:
 - tworzy virtualenv (`.venv`),
 - aktywuje środowisko,
 - aktualizuje `pip`,
-- instaluje komplet zależności zpinowanych pod Python 3.13, aby uniknąć kompilacji Rust/C (`transformers==4.39.0`, `sentence-transformers==2.6.1`, `faiss-cpu==1.13.2`, `torch==2.10.0`, `PyPDF2==3.0.1`, `python-docx==1.2.0`, `html2text==2025.4.15`, `python-dotenv==1.0.1`).
+- instaluje komplet zależności zpinowanych pod Python 3.13/3.11, aby uniknąć kompilacji Rust/C (`transformers==4.46.2`, `tokenizers==0.20.3`, `sentence-transformers==2.6.1`, `faiss-cpu==1.13.2`, `torch==2.10.0`, `PyPDF2==3.0.1`, `python-docx==1.2.0`, `html2text==2025.4.15`, `python-dotenv==1.0.1`).
 
 Po zakończeniu aktywuj środowisko komendą `source .venv/bin/activate`.
 
@@ -76,6 +76,8 @@ make test                         # uruchamia pytest
 make clean                        # usuwa katalog .venv
 make docker-build                 # buduje obraz Dockera bolmo-rag
 make docker-run FOLDER=... QUERY=... # buduje i uruchamia obraz z zamontowanymi docs/.env
+make docker-shell                 # wchodzi do python:3.11 z repo pod /app
+make docker-up / docker-logs / docker-stop # zarządza kontenerem w tle
 ```
 
 ### Opis celów
@@ -86,6 +88,32 @@ make docker-run FOLDER=... QUERY=... # buduje i uruchamia obraz z zamontowanymi 
 - **clean** – usuwa katalog `.venv`, pozwalając rozpocząć instalację od zera.
 - **docker-build** – pakuje aplikację w obraz Dockera z wykorzystaniem `requirements.txt`.
 - **docker-run** – uruchamia wcześniej zbudowany obraz z podmontowanym katalogiem `docs/` i plikiem `.env`, dzięki czemu można zmieniać korpusy bez przebudowy obrazu.
+- **docker-shell** – otwiera tymczasowy kontener `python:3.11` z repozytorium zamontowanym pod `/app`; idealne do ręcznego testowania `pip install -r requirements.txt && make run ...` w kontrolowanym środowisku.
+- **docker-up** – startuje kontener w tle (nazwa `bolmo-rag-run`),
+- **docker-logs** – tailuje logi działającego kontenera,
+- **docker-stop** – zatrzymuje i usuwa kontener uruchomiony przez `docker-up`.
+
+### Scenariusz „Docker + logi”
+
+1. Zbuduj obraz i odpal pipeline w tle:
+
+   ```bash
+   make docker-up FOLDER=./docs QUERY="Co to jest Bolmo?"
+   ```
+
+2. Podejrzyj logi na żywo (działa jak `docker logs -f`):
+
+   ```bash
+   make docker-logs
+   ```
+
+3. Po zakończeniu zatrzymaj kontener:
+
+   ```bash
+   make docker-stop
+   ```
+
+Jeżeli chcesz jedynie wejść w interaktywnego `bash`a w obrazie referencyjnym, uruchom `make docker-shell`, a następnie w kontenerze wykonaj `python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt && make run ...`.
 
 ### Przykładowe użycie celu `run`
 

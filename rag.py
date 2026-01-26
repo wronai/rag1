@@ -7,8 +7,32 @@ import faiss
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+import transformers.configuration_utils as _hf_configuration_utils
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
+
+
+def _ensure_layer_type_validation():
+    """Backport transformers.layer_type_validation for models that expect it."""
+
+    if hasattr(_hf_configuration_utils, "layer_type_validation"):
+        return
+
+    def layer_type_validation(layer_types):
+        if layer_types is None:
+            return
+        if not isinstance(layer_types, (list, tuple)):
+            raise ValueError("layer_types must be a list or tuple of strings")
+        for idx, layer_type in enumerate(layer_types):
+            if not isinstance(layer_type, str):
+                raise ValueError(
+                    f"Layer type at position {idx} must be a string, got {type(layer_type)}"
+                )
+
+    _hf_configuration_utils.layer_type_validation = layer_type_validation
+
+
+_ensure_layer_type_validation()
 
 load_dotenv()
 
@@ -111,31 +135,62 @@ def load_all_docs(folder):
     return docs
 
 # -----------------------------
-# 3) Chunkowanie (ważne w RAG)
+# 3) Chunkowanie po akapitach
 # -----------------------------
 
-def chunk_text(text, chunk_size=1000, overlap=200):
+def chunk_text(text, chunk_size=800, overlap=200):
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
     chunks = []
-    start = 0
-    while start < len(text):
-        end = min(start + chunk_size, len(text))
-        chunks.append(text[start:end])
-        start = end - overlap
+    current = ""
+
+    for p in paragraphs:
+        if len(current) + len(p) < chunk_size:
+            current += "\n\n" + p
+        else:
+            chunks.append(current.strip())
+            current = p
+
+    if current:
+        chunks.append(current.strip())
+
+    # overlap
+    if overlap > 0:
+        merged = []
+        for i, c in enumerate(chunks):
+            if i == 0:
+                merged.append(c)
+            else:
+                merged.append(chunks[i-1][-overlap:] + "\n\n" + c)
+        return merged
+
     return chunks
 
 # -----------------------------
-# 4) Budowa FAISS index
+# 4) FAISS persistencja
+# -----------------------------
+
+def save_faiss(index, path):
+    faiss.write_index(index, path)
+
+def load_faiss(path):
+    return faiss.read_index(path)
+
+# -----------------------------
+# 5) Budowa FAISS index (HNSW)
 # -----------------------------
 
 def build_faiss_index(chunks, embedder):
     embeddings = embedder.encode([c for _, c in chunks], convert_to_numpy=True)
     dim = embeddings.shape[1]
-    index = faiss.IndexFlatL2(dim)
+
+    index = faiss.IndexHNSWFlat(dim, 32)
+    index.hnsw.efConstruction = 40
     index.add(embeddings)
+
     return index, embeddings
 
 # -----------------------------
-# 5) Retrieval
+# 6) Retrieval
 # -----------------------------
 
 def retrieve(query, chunks, index, embedder, k=5):
@@ -148,21 +203,24 @@ def retrieve(query, chunks, index, embedder, k=5):
     return results
 
 # -----------------------------
-# 6) Generowanie odpowiedzi (Bolmo)
+# 7) Generowanie odpowiedzi (Bolmo)
 # -----------------------------
 
 def generate_answer(question, docs, model, tokenizer, device):
     context = "\n".join([f"### {os.path.basename(p)}\n{c}" for p, c in docs])
 
     prompt = f"""
-You are a helpful assistant. Use ONLY the context below to answer.
+You are a helpful assistant.
+
+Use ONLY the context below to answer.
+If the answer is not in the context, respond: "Nie mam informacji w dokumentach."
 
 Context:
 {context}
 
 Question: {question}
 
-Answer in Polish in markdown format:
+Answer in Polish in markdown format with references like [1], [2].
 """
 
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
@@ -178,7 +236,7 @@ Answer in Polish in markdown format:
     return tokenizer.decode(outputs[0], skip_special_tokens=True)
 
 # -----------------------------
-# 7) Main
+# 8) Main
 # -----------------------------
 
 def main():
@@ -206,8 +264,16 @@ def main():
     log(f"Ładowanie embeddera {embedder_name}...")
     embedder = SentenceTransformer(embedder_name)
 
-    log("Budowa indeksu FAISS...")
-    index, _ = build_faiss_index(chunks, embedder)
+    index_path = os.path.join(args.folder, "faiss.index")
+
+    if os.path.exists(index_path):
+        log("Ładowanie istniejącego indexu FAISS...")
+        index = load_faiss(index_path)
+    else:
+        log("Budowa indexu FAISS...")
+        index, _ = build_faiss_index(chunks, embedder)
+        save_faiss(index, index_path)
+        log("Index zapisany na dysku.")
 
     log(f"Retrieval – wyszukiwanie {args.k} fragmentów...")
     retrieved = retrieve(args.query, chunks, index, embedder, k=args.k)
@@ -216,7 +282,23 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model_name = os.getenv("BOLMO_MODEL", "allenai/Bolmo-1B")
     log(f"Ładowanie modelu {model_name} na urządzeniu {device}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+
+    tokenizer = None
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    except Exception as err:
+        log(
+            "Nie udało się załadować szybkiego tokenizera (use_fast=True) – "
+            "przechodzę na wersję wolną."
+        )
+        log(f"Szczegóły: {err}")
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_name, trust_remote_code=True, use_fast=False
+            )
+        except Exception:
+            raise
+
     model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True).to(device)
 
     log("Generowanie odpowiedzi...")
