@@ -13,7 +13,7 @@ $(VENV)/bin/activate: install.sh
 	touch $(VENV)/bin/activate
 
 run: install
-	$(PYTHON) rag.py --folder $(FOLDER) --query "$(QUERY)" --k $(K)
+	CUDA_HOME=/usr/local/cuda $(PYTHON) rag.py --folder $(FOLDER) --query "$(QUERY)" --k $(K)
 
 test: install
 	$(PYTHON) -m pytest -q

@@ -1,6 +1,7 @@
-transformers==4.46.2
-tokenizers==0.20.3
-sentence-transformers==2.6.1
+transformers==4.57.3
+xlstm==2.0.4
+tokenizers==0.22.2
+sentence-transformers==3.1.1
 faiss-cpu==1.13.2
 torch==2.10.0
 numpy==2.1.2

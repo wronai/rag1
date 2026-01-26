@@ -3,11 +3,13 @@ import argparse
 import json
 import csv
 from io import StringIO
+from typing import TypedDict
 import faiss
 import numpy as np
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 import transformers.configuration_utils as _hf_configuration_utils
+import transformers.utils.generic as _hf_generic
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 
@@ -33,6 +35,19 @@ def _ensure_layer_type_validation():
 
 
 _ensure_layer_type_validation()
+
+
+def _ensure_transformers_kwargs():
+    if hasattr(_hf_generic, "TransformersKwargs"):
+        return
+
+    class TransformersKwargs(TypedDict, total=False):
+        pass
+
+    _hf_generic.TransformersKwargs = TransformersKwargs
+
+
+_ensure_transformers_kwargs()
 
 load_dotenv()
 
@@ -224,16 +239,37 @@ Answer in Polish in markdown format with references like [1], [2].
 """
 
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    input_len = inputs["input_ids"].shape[-1]
 
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=512,
-        do_sample=False,
-        temperature=0.7,
-        pad_token_id=tokenizer.eos_token_id
-    )
+    try:
+        outputs = model.generate(
+            inputs["input_ids"],
+            attention_mask=inputs.get("attention_mask", None),
+            max_new_tokens=512,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+    except TypeError as e:
+        log(f"TypeError in generate call: {e}")
+        log("Trying alternative generate call signature...")
+        try:
+            outputs = model.generate(
+                inputs=inputs["input_ids"],
+                attention_mask=inputs.get("attention_mask", None),
+                max_new_tokens=512,
+                do_sample=False,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+        except Exception as e2:
+            log(f"Alternative generate call failed: {e2}")
+            raise
 
-    return tokenizer.decode(outputs[0], skip_special_tokens=True)
+    sequences = getattr(outputs, "sequences", outputs)
+    generated = sequences[0]
+    generated_only = generated[input_len:]
+    if generated_only.numel() == 0:
+        return ""
+    return tokenizer.decode(generated_only, skip_special_tokens=True)
 
 # -----------------------------
 # 8) Main
@@ -279,7 +315,38 @@ def main():
     retrieved = retrieve(args.query, chunks, index, embedder, k=args.k)
     log(f"Pobrano {len(retrieved)} fragmentów kontekstu.")
 
+    force_cpu = os.getenv("BOLMO_FORCE_CPU", "").strip().lower() in {"1", "true", "yes"}
+    if force_cpu and hasattr(torch, "cuda"):
+        torch.cuda.is_available = lambda: False
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if device == "cuda" and "CUDA_HOME" not in os.environ:
+        candidates = (
+            "/usr/local/cuda",
+            "/usr/local/cuda-12.4",
+            "/usr/local/cuda-12.3",
+            "/usr/local/cuda-12.2",
+            "/usr/local/cuda-12.1",
+            "/usr/local/cuda-12.0",
+            "/usr/local/cuda-11.8",
+        )
+        for cand in candidates:
+            if os.path.isdir(os.path.join(cand, "include")):
+                os.environ["CUDA_HOME"] = cand
+                log(f"Ustawiam CUDA_HOME={cand}")
+                break
+
+        if "CUDA_HOME" not in os.environ:
+            log(
+                "CUDA wykryte, ale CUDA_HOME nie jest ustawione i nie udało się go auto-wykryć. "
+                "Ustaw CUDA_HOME na katalog instalacji CUDA Toolkit (np. /usr/local/cuda) lub uruchom z BOLMO_FORCE_CPU=1. "
+                "Przechodzę na CPU."
+            )
+            if hasattr(torch, "cuda"):
+                torch.cuda.is_available = lambda: False
+            device = "cpu"
+
     model_name = os.getenv("BOLMO_MODEL", "allenai/Bolmo-1B")
     log(f"Ładowanie modelu {model_name} na urządzeniu {device}...")
 
@@ -299,7 +366,22 @@ def main():
         except Exception:
             raise
 
-    model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True).to(device)
+    model = None
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True).to(device)
+    except Exception as e:
+        log(f"Error loading model with default settings: {e}")
+        log("Attempting to load model with additional compatibility settings...")
+        try:
+            config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+            if hasattr(config, 'rope_scaling') and hasattr(config.rope_scaling, 'type'):
+                config.rope_scaling.type = 'linear'  # Use a known valid type
+            elif hasattr(config, 'rope_type'):
+                config.rope_type = 'linear'  # Fallback to a known type if 'default' is not supported
+            model = AutoModelForCausalLM.from_pretrained(model_name, config=config, trust_remote_code=True, ignore_mismatched_sizes=True).to(device)
+        except Exception as e2:
+            log(f"Failed to load model with compatibility settings: {e2}")
+            raise
 
     log("Generowanie odpowiedzi...")
     answer = generate_answer(args.query, retrieved, model, tokenizer, device)
