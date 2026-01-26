@@ -26,25 +26,66 @@ Skrypt:
 - tworzy virtualenv (`.venv`),
 - aktywuje środowisko,
 - aktualizuje `pip`,
-- instaluje komplet zależności: `transformers==4.34.0`, `sentence-transformers`, `faiss-cpu`, `torch`, `PyPDF2`, `python-docx`, `html2text`, `pandas`.
+- instaluje komplet zależności zpinowanych pod Python 3.13, aby uniknąć kompilacji Rust/C (`transformers==4.39.0`, `sentence-transformers==2.6.1`, `faiss-cpu==1.13.2`, `torch==2.10.0`, `PyPDF2==3.0.1`, `python-docx==1.2.0`, `html2text==2025.4.15`, `python-dotenv==1.0.1`).
 
 Po zakończeniu aktywuj środowisko komendą `source .venv/bin/activate`.
 
-## Automatyzacja za pomocą Makefile
+> **Uwaga:** jeśli pracujesz na starszej dystrybucji, upewnij się, że masz zainstalowane `build-essential`, `rustc` oraz `cargo`; nowe paczki powinny jednak instalować się z gotowych kółek (wheels) i nie wymagać kompilacji.
 
-Makefile udostępnia trzy główne cele:
+
+## Przykładowa kolekcja `docs/`
+
+Repozytorium zawiera katalog `docs/` z wieloma formatami, które możesz wykorzystać do szybkiego testu pipeline'u:
+
+- `readme.txt` – tekstowe wprowadzenie do korpusu.
+- `faq.md` – markdown z najczęstszymi pytaniami.
+- `support.html` – prosty dokument HTML do sprawdzenia ekstrakcji z treści webowych.
+- `schedule.csv` – tabela z harmonogramem zadań.
+- `config.json` – przykładowa konfiguracja indeksowania.
+- `meeting_notes.docx` – notatki ze spotkania w formacie Word.
+- `overview.pdf` – krótki PDF opisujący demo Bolmo RAG.
+
+Aby uruchomić demo na tych danych:
 
 ```bash
-make install                 # tworzy .venv poprzez install.sh
-make run FOLDER=./ QUERY="Co to jest Bolmo?"   # uruchamia rag.py z parametrami
-make clean                   # usuwa katalog .venv
+make run FOLDER=./docs QUERY="Co zawiera pakiet demo?"
+```
+
+### Konfiguracja modeli przez `.env`
+
+1. Sklonuj plik wzorcowy i ustaw zmienną:
+
+   ```bash
+   cp .env.example .env
+   ```
+
+2. Otwórz `.env` i ustaw:
+   - `BOLMO_MODEL` – model generatywny (domyślnie `allenai/Bolmo-1B`). Jeśli masz zasoby GPU, możesz przełączyć na `allenai/Bolmo-7B`.
+   - `BOLMO_EMBEDDER` – sentence-transformer do częśći retrieval (domyślnie `all-MiniLM-L6-v2`). Możesz wskazać np. `sentence-transformers/all-mpnet-base-v2`.
+
+Skrypt `rag.py` ładuje `.env` automatycznie dzięki `python-dotenv`, więc każda zmiana wartości jest widoczna przy kolejnym uruchomieniu `make run`.
+
+## Automatyzacja za pomocą Makefile
+
+Makefile udostępnia zestaw celów:
+
+```bash
+make install                      # tworzy .venv poprzez install.sh
+make run FOLDER=./docs QUERY="?"   # uruchamia rag.py z parametrami
+make test                         # uruchamia pytest
+make clean                        # usuwa katalog .venv
+make docker-build                 # buduje obraz Dockera bolmo-rag
+make docker-run FOLDER=... QUERY=... # buduje i uruchamia obraz z zamontowanymi docs/.env
 ```
 
 ### Opis celów
 
 - **install** – zależy od pliku `.venv/bin/activate`; jeżeli środowisko nie istnieje, uruchamia `install.sh` i tworzy plik znacznika w katalogu `.venv`.
 - **run** – zapewnia, że środowisko jest gotowe (wywołuje `make install`), a następnie uruchamia `rag.py` z przekazanymi argumentami `--folder` oraz `--query`.
+- **test** – uruchamia `pytest`, aby sprawdzić podstawowe wczytywanie dokumentów.
 - **clean** – usuwa katalog `.venv`, pozwalając rozpocząć instalację od zera.
+- **docker-build** – pakuje aplikację w obraz Dockera z wykorzystaniem `requirements.txt`.
+- **docker-run** – uruchamia wcześniej zbudowany obraz z podmontowanym katalogiem `docs/` i plikiem `.env`, dzięki czemu można zmieniać korpusy bez przebudowy obrazu.
 
 ### Przykładowe użycie celu `run`
 
@@ -66,27 +107,9 @@ make run FOLDER=./docs QUERY="Co to jest Bolmo?"  # uruchamia RAG na próbkach z
 
 Pierwsze dwa kroki gwarantują czyste środowisko, a trzeci demonstruje pełne wywołanie pipeline'u na przykładowej kolekcji.
 
-## Przykładowa kolekcja `docs/`
-
-Repozytorium zawiera katalog `docs/` z wieloma formatami, które możesz wykorzystać do szybkiego testu pipeline'u:
-
-- `readme.txt` – tekstowe wprowadzenie do korpusu.
-- `faq.md` – markdown z najczęstszymi pytaniami.
-- `support.html` – prosty dokument HTML do sprawdzenia ekstrakcji z treści webowych.
-- `schedule.csv` – tabela z harmonogramem zadań.
-- `config.json` – przykładowa konfiguracja indeksowania.
-- `meeting_notes.docx` – notatki ze spotkania w formacie Word.
-- `overview.pdf` – krótki PDF opisujący demo Bolmo RAG.
-
-Aby uruchomić demo na tych danych:
-
-```bash
-make run FOLDER=./docs QUERY="Co zawiera pakiet demo?"
-```
 
 ## Dalsze kroki
 
-- Dodaj dodatkowe cele (`test`, `lint`, generowanie raportów) w Makefile, jeżeli potrzebujesz bardziej rozbudowanych przepływów pracy.
 - Rozbuduj `rag.py` (lub alternatywny skrypt, np. `bolmo_rag.py`) o własne logiki indeksowania czy interfejs CLI. Makefile i struktura środowiska są gotowe na kolejne rozszerzenia.
 
 Powodzenia w pracy z Bolmo RAG!

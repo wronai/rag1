@@ -1,12 +1,20 @@
 import os
 import argparse
 import json
-import pandas as pd
+import csv
+from io import StringIO
 import faiss
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from sentence_transformers import SentenceTransformer
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+def log(message: str):
+    print(f"[rag] {message}", flush=True)
 
 # PDF
 from PyPDF2 import PdfReader
@@ -45,8 +53,20 @@ def load_html(path):
     return html2text.html2text(html)
 
 def load_csv(path):
-    df = pd.read_csv(path, encoding="utf-8", errors="ignore")
-    return df.to_string()
+    def _read(handle):
+        reader = csv.reader(handle)
+        lines = []
+        for row in reader:
+            lines.append(", ".join(row))
+        return "\n".join(lines)
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return _read(f)
+    except UnicodeDecodeError:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            buffer = StringIO(f.read())
+        return _read(buffer)
 
 def load_json(path):
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -82,7 +102,7 @@ def load_all_docs(folder):
                 else:
                     continue
             except Exception as e:
-                print(f"Warning: failed to load {path}: {e}")
+                log(f"Warning: failed to load {path}: {e}")
                 continue
 
             if text.strip():
@@ -168,34 +188,38 @@ def main():
     parser.add_argument("--k", type=int, default=5, help="Ile fragmentów pobrać (retrieval)")
     args = parser.parse_args()
 
-    # Load docs
+    log(f"Ładowanie dokumentów z {args.folder}...")
     docs = load_all_docs(args.folder)
     if not docs:
-        print("No documents found.")
+        log("Brak dokumentów w podanym folderze.")
         return
+    log(f"Załadowano {len(docs)} plików.")
 
-    # Chunk docs
+    log("Chunkowanie dokumentów...")
     chunks = []
     for path, text in docs:
         for chunk in chunk_text(text):
             chunks.append((path, chunk))
+    log(f"Chunkowanie zakończone – {len(chunks)} fragmentów.")
 
-    # Load embedder
-    embedder = SentenceTransformer("all-MiniLM-L6-v2")
+    embedder_name = os.getenv("BOLMO_EMBEDDER", "all-MiniLM-L6-v2")
+    log(f"Ładowanie embeddera {embedder_name}...")
+    embedder = SentenceTransformer(embedder_name)
 
-    # Build FAISS
+    log("Budowa indeksu FAISS...")
     index, _ = build_faiss_index(chunks, embedder)
 
-    # Retrieve
+    log(f"Retrieval – wyszukiwanie {args.k} fragmentów...")
     retrieved = retrieve(args.query, chunks, index, embedder, k=args.k)
+    log(f"Pobrano {len(retrieved)} fragmentów kontekstu.")
 
-    # Load Bolmo
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model_name = "allenai/Bolmo-7B"
+    model_name = os.getenv("BOLMO_MODEL", "allenai/Bolmo-1B")
+    log(f"Ładowanie modelu {model_name} na urządzeniu {device}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True).to(device)
 
-    # Generate answer
+    log("Generowanie odpowiedzi...")
     answer = generate_answer(args.query, retrieved, model, tokenizer, device)
 
     print(answer)
